@@ -1,0 +1,99 @@
+name: Deploy Garuda CBT to Gumukmas
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gumukmas-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy via SCP
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+      SSH_PORT: ${{ secrets.SSH_PORT }}
+      SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+      SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Package application
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Keep runtime data, credentials, and dependencies on the VPS.
+          tar -czf /tmp/cbt-release.tar.gz \
+            --exclude='./.git' \
+            --exclude='./.github' \
+            --exclude='./.env*' \
+            --exclude='./vendor' \
+            --exclude='./uploads' \
+            --exclude='./backups' \
+            --exclude='./application/logs' \
+            --exclude='./application/cache' \
+            .
+
+      - name: Configure SSH with pinned host key
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+
+      - name: Upload and deploy to VPS
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT="${SSH_PORT:-22}"
+          REMOTE_ARCHIVE="cbt-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.tar.gz"
+          SSH_OPTS=(-i "$HOME/.ssh/id_ed25519" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes)
+
+          scp -P "$PORT" "${SSH_OPTS[@]}" \
+            /tmp/cbt-release.tar.gz \
+            "${SSH_USER}@${SSH_HOST}:~/${REMOTE_ARCHIVE}"
+
+          ssh -p "$PORT" "${SSH_OPTS[@]}" \
+            "${SSH_USER}@${SSH_HOST}" "bash -s -- '${REMOTE_ARCHIVE}'" <<'REMOTE'
+          set -euo pipefail
+          APP_DIR="/var/www/gumukmas"
+          ARCHIVE="$HOME/$1"
+          trap 'rm -f "$ARCHIVE"' EXIT
+
+          mkdir -p "$APP_DIR"
+
+          # On the first deploy, ship the default config files for the web installer.
+          # On later deploys, preserve live DB credentials and site-specific settings.
+          EXCLUDES=()
+          if [ -f "$APP_DIR/application/config/database.php" ]; then
+            EXCLUDES+=(--exclude='./application/config/database.php')
+          fi
+          if [ -f "$APP_DIR/application/config/config.php" ]; then
+            EXCLUDES+=(--exclude='./application/config/config.php')
+          fi
+
+          tar -xzf "$ARCHIVE" -C "$APP_DIR" "${EXCLUDES[@]}"
+
+          mkdir -p "$APP_DIR/backups" "$APP_DIR/application/logs" "$APP_DIR/application/cache"
+          mkdir -p "$APP_DIR/uploads"/{bank_soal,file_siswa,foto_siswa,import,materi,profiles,settings,temp,tugas}
+
+          cd "$APP_DIR"
+          php8.3 "$(command -v composer)" install \
+            --no-dev --no-interaction --prefer-dist --optimize-autoloader --no-progress
+          php8.3 -l index.php
+          echo "Garuda CBT deployment completed."
+          REMOTE
