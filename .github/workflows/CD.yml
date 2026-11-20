@@ -1,10 +1,9 @@
 
-name: Deploy Garuda CBT to Gumukmas
+name: Deploy Garuda CBT
 
 on:
   push:
-    branches:
-      - master
+    branches: [master]
   workflow_dispatch:
 
 permissions:
@@ -16,9 +15,9 @@ concurrency:
 
 jobs:
   deploy:
-    name: Deploy via SCP
+    name: Build and Deploy via SCP
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     env:
       SSH_HOST: ${{ secrets.SSH_HOST }}
@@ -28,70 +27,110 @@ jobs:
       SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
 
     steps:
-      # 1. Checkout repository
-      - name: Checkout source
-        uses: actions/checkout@v4
+      # 1. Checkout source
+      - name: Checkout repository
+        uses: actions/checkout@v5
 
-      # 2. Package application
-      - name: Package application
-        shell: bash
+      # 2. Setup PHP 8.3 on GitHub Runner
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: mbstring, dom, xml, gd, zip, mysqli, calendar, fileinfo, iconv, intl, curl
+          tools: composer:v2
+          coverage: none
+
+      # 3. Install Composer dependencies on GitHub
+      - name: Install dependencies
         run: |
           set -euo pipefail
 
-          tar -czf /tmp/cbt-release.tar.gz \
+          composer install \
+            --no-dev \
+            --no-interaction \
+            --prefer-dist \
+            --optimize-autoloader \
+            --no-progress \
+            --ignore-platform-req=php+
+
+          test -f vendor/autoload.php
+
+          echo "Dependencies installed successfully"
+
+      # 4. Validate application
+      - name: Validate application
+        run: |
+          php -l index.php
+          test -d application
+          test -d system
+          test -d vendor
+          test -f composer.lock
+
+      # 5. Package complete application
+      - name: Package application
+        run: |
+          set -euo pipefail
+
+          tar -czf /tmp/gumukmas-release.tar.gz \
             --exclude='./.git' \
             --exclude='./.github' \
             --exclude='./.env*' \
-            --exclude='./vendor' \
             --exclude='./uploads' \
             --exclude='./backups' \
             --exclude='./application/logs' \
             --exclude='./application/cache' \
             .
 
-      # 3. Configure SSH
+          echo "Release package created"
+          ls -lh /tmp/gumukmas-release.tar.gz
+
+      # 6. Configure SSH
       - name: Configure SSH
-        shell: bash
         run: |
           set -euo pipefail
 
-          install -m 700 -d "$HOME/.ssh"
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
 
-          printf '%s\n' "$SSH_PRIVATE_KEY" \
-            > "$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
 
-          chmod 600 "$HOME/.ssh/id_ed25519"
+          chmod 600 ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/known_hosts
 
-          printf '%s\n' "$SSH_KNOWN_HOSTS" \
-            > "$HOME/.ssh/known_hosts"
-
-          chmod 600 "$HOME/.ssh/known_hosts"
-
-      # 4. Upload application through SCP
-      - name: Upload application to VPS
-        shell: bash
+      # 7. Upload complete package via SCP
+      - name: Upload via SCP
         run: |
           set -euo pipefail
 
           PORT="${SSH_PORT:-22}"
+          ARCHIVE="gumukmas-${GITHUB_RUN_ID}.tar.gz"
 
-          SSH_OPTS=(
-            -i "$HOME/.ssh/id_ed25519"
-            -o IdentitiesOnly=yes
-            -o BatchMode=yes
-            -o StrictHostKeyChecking=yes
-          )
+          scp \
+            -P "$PORT" \
+            -i ~/.ssh/id_ed25519 \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            /tmp/gumukmas-release.tar.gz \
+            "${SSH_USER}@${SSH_HOST}:~/${ARCHIVE}"
 
-          REMOTE_ARCHIVE="cbt-release-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.tar.gz"
+          echo "SCP upload completed"
 
-          scp -P "$PORT" "${SSH_OPTS[@]}" \
-            /tmp/cbt-release.tar.gz \
-            "${SSH_USER}@${SSH_HOST}:~/${REMOTE_ARCHIVE}"
+      # 8. Extract application on VPS
+      - name: Deploy application
+        run: |
+          set -euo pipefail
 
-          # 5. Extract and install on VPS
-          ssh -p "$PORT" "${SSH_OPTS[@]}" \
+          PORT="${SSH_PORT:-22}"
+          ARCHIVE="gumukmas-${GITHUB_RUN_ID}.tar.gz"
+
+          ssh \
+            -p "$PORT" \
+            -i ~/.ssh/id_ed25519 \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
             "${SSH_USER}@${SSH_HOST}" \
-            "bash -s -- '${REMOTE_ARCHIVE}'" <<'REMOTE'
+            "bash -s -- '$ARCHIVE'" <<'REMOTE'
 
           set -euo pipefail
 
@@ -100,7 +139,7 @@ jobs:
 
           trap 'rm -f "$ARCHIVE"' EXIT
 
-          echo "Preparing deployment directory..."
+          echo "Deploying Garuda CBT..."
 
           mkdir -p "$APP_DIR"
 
@@ -115,55 +154,33 @@ jobs:
             EXCLUDES+=(--exclude='./application/config/config.php')
           fi
 
-          echo "Extracting source code..."
-
+          # Extract prebuilt application, including vendor
           tar -xzf "$ARCHIVE" \
             -C "$APP_DIR" \
             "${EXCLUDES[@]}"
 
-          # Preserve runtime data
-          echo "Preparing runtime directories..."
-
+          # Create persistent runtime directories
           mkdir -p \
             "$APP_DIR/backups" \
             "$APP_DIR/application/logs" \
             "$APP_DIR/application/cache"
 
-          mkdir -p "$APP_DIR/uploads"/{
-            bank_soal,
-            file_siswa,
-            foto_siswa,
-            import,
-            materi,
-            profiles,
-            settings,
-            temp,
-            tugas
-          }
+          for dir in \
+            bank_soal file_siswa foto_siswa import \
+            materi profiles settings temp tugas
+          do
+            mkdir -p "$APP_DIR/uploads/$dir"
+          done
 
-          cd "$APP_DIR"
-
-          # 6. Install locked Composer dependencies
-          echo "Installing Composer dependencies..."
-
-          php8.3 "$(command -v composer)" install \
-            --no-dev \
-            --no-interaction \
-            --prefer-dist \
-            --optimize-autoloader \
-            --no-progress \
-            --ignore-platform-req=php+
-
-          # 7. Verify application
-          echo "Verifying PHP syntax..."
-
-          php8.3 -l index.php
+          # Verify deployed files
+          test -f "$APP_DIR/index.php"
+          test -f "$APP_DIR/vendor/autoload.php"
 
           echo "================================"
-          echo "Garuda CBT deployment successful"
+          echo "DEPLOYMENT SUCCESSFUL"
           echo "Domain: gumukmas.congfandi.com"
-          echo "Directory: /var/www/gumukmas"
           echo "PHP: 8.3"
+          echo "Dependencies: Pre-installed"
           echo "================================"
 
           REMOTE
